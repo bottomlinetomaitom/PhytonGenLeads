@@ -4,24 +4,24 @@ SOVEREIGN LEAD ENGINE v3.5
 Async · Retry · AI (Ollama) · Heuristic Fallback · SQLite · CSV/JSON Export
 =============================================================================
 
-Miglioramenti rispetto a v3.4:
-  - Configurazione centralizzata via dataclass EngineConfig (no magic globals)
-  - LeadDB ora usa connection-per-thread (sqlite3 thread safety)
-  - Retry con jitter esponenziale e rispetto dell'header Retry-After (429)
-  - extract_emails: regex compilata, deduplication robusta
-  - _heuristic_analysis: scoring pesato su densità keyword + lunghezza testo
-  - run(): progress tracking con contatori atomici
-  - main(): timing preciso con time.perf_counter(), riepilogo dettagliato
-  - Type hints completi, docstring su ogni funzione pubblica
-  - Nessuna importazione lazy tranne 'ollama' (facoltativo)
-  - Compatibile Python 3.10+
+Improvements over v3.4:
+  - Centralised configuration via EngineConfig dataclass (no magic globals)
+  - LeadDB now uses one connection per thread (sqlite3 thread safety)
+  - Retry with exponential jitter and Retry-After header support (429)
+  - extract_emails: pre-compiled regex, robust deduplication
+  - _heuristic_analysis: weighted scoring on keyword density + text length
+  - run(): progress tracking with shared counters
+  - main(): accurate timing with time.perf_counter(), detailed summary
+  - Full type hints, docstrings on every public function
+  - No lazy imports except 'ollama' (optional dependency)
+  - Compatible with Python 3.10+
 =============================================================================
 """
 
 from __future__ import annotations
 
+import argparse
 import asyncio
-import aiohttp
 import csv
 import json
 import logging
@@ -32,11 +32,10 @@ import sqlite3
 import threading
 import time
 from dataclasses import dataclass, field
-from datetime import datetime
 from typing import Dict, List, Optional
 from urllib.parse import urlparse
 
-import argparse
+import aiohttp
 from bs4 import BeautifulSoup
 
 # ---------------------------------------------------------------------------
@@ -45,7 +44,7 @@ from bs4 import BeautifulSoup
 
 @dataclass
 class EngineConfig:
-    """Unica fonte di verità per tutti i parametri del motore."""
+    """Single source of truth for all engine parameters."""
 
     db_name:           str   = field(default_factory=lambda: os.getenv("LEAD_DB", "leads.db"))
     ollama_model:      str   = field(default_factory=lambda: os.getenv("OLLAMA_MODEL", "llama3"))
@@ -108,9 +107,8 @@ EMAIL_BLOCKED_EXTENSIONS: frozenset[str] = frozenset({
     ".png", ".jpg", ".gif", ".svg", ".css", ".js", ".woff",
 })
 
-_EMAIL_RE = re.compile(
-    r"[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}"
-)
+# Pre-compiled once at module load — never recompiled per call
+_EMAIL_RE = re.compile(r"[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}")
 
 # ---------------------------------------------------------------------------
 # LOGGING
@@ -120,7 +118,7 @@ logger = logging.getLogger(__name__)
 
 
 def setup_logging(level: str = "INFO") -> None:
-    """Configura logging su stdout + file con formato standard."""
+    """Configure logging to stdout and a file with a standard format."""
     logging.basicConfig(
         level=getattr(logging, level.upper(), logging.INFO),
         format="%(asctime)s [%(levelname)-8s] %(message)s",
@@ -131,6 +129,7 @@ def setup_logging(level: str = "INFO") -> None:
         ],
     )
 
+
 # ---------------------------------------------------------------------------
 # DATABASE
 # ---------------------------------------------------------------------------
@@ -139,9 +138,9 @@ class LeadDB:
     """
     Thread-safe SQLite wrapper.
 
-    Usa un dizionario di connessioni per thread (una per thread) invece di
-    una singola connessione condivisa con lock: elimina l'overhead del lock
-    sulle letture e sfrutta correttamente sqlite3 in modalità WAL.
+    Uses one connection per thread (threading.local) instead of a single
+    shared connection with a global lock. This eliminates read contention
+    and correctly leverages SQLite's WAL journal mode.
     """
 
     _CREATE_TABLE = """
@@ -161,7 +160,7 @@ class LeadDB:
     def __init__(self, db_name: str = "") -> None:
         self._db_name = db_name or CONFIG.db_name
         self._local   = threading.local()
-        # Inizializza schema nel thread principale
+        # Initialise schema on the main thread
         conn = self._conn()
         conn.execute("PRAGMA journal_mode=WAL;")
         conn.execute("PRAGMA synchronous=NORMAL;")
@@ -175,7 +174,7 @@ class LeadDB:
     # ------------------------------------------------------------------
 
     def _conn(self) -> sqlite3.Connection:
-        """Restituisce la connessione del thread corrente, creandola se necessario."""
+        """Return the current thread's connection, creating it if necessary."""
         if not getattr(self._local, "conn", None):
             conn = sqlite3.connect(self._db_name, check_same_thread=False)
             conn.row_factory = sqlite3.Row
@@ -199,13 +198,13 @@ class LeadDB:
 
     def save(self, data: Dict) -> bool:
         """
-        Inserisce un lead. Restituisce True se salvato, False se duplicato o invalido.
+        Insert a lead record. Returns True if saved, False if duplicate or invalid.
 
         Args:
-            data: dizionario con chiavi company, service, score, url, emails.
+            data: dict with keys company, service, score, url, emails.
 
         Returns:
-            True se la riga è stata inserita, False altrimenti.
+            True if the row was inserted, False otherwise.
         """
         company = (data.get("company") or "").strip()
         if not company:
@@ -235,13 +234,13 @@ class LeadDB:
 
     def export_csv(self, path: str) -> int:
         """
-        Esporta tutti i lead in CSV ordinati per score decrescente.
+        Export all leads to CSV sorted by score descending.
 
         Args:
-            path: percorso del file di output.
+            path: output file path.
 
         Returns:
-            Numero di righe esportate.
+            Number of rows exported.
         """
         cols = ("company", "service", "score", "url", "domain", "emails", "created_at")
         rows = self._conn().execute(
@@ -254,18 +253,18 @@ class LeadDB:
             writer.writerow(cols)
             writer.writerows(rows)
 
-        logger.info("Exported %d leads → %s", len(rows), path)
+        logger.info("Exported %d leads -> %s", len(rows), path)
         return len(rows)
 
     def export_json(self, path: str) -> int:
         """
-        Esporta tutti i lead in JSON ordinati per score decrescente.
+        Export all leads to JSON sorted by score descending.
 
         Args:
-            path: percorso del file di output.
+            path: output file path.
 
         Returns:
-            Numero di record esportati.
+            Number of records exported.
         """
         cols = ("company", "service", "score", "url", "domain", "emails", "created_at")
         rows = [
@@ -279,19 +278,20 @@ class LeadDB:
         with open(path, "w", encoding="utf-8") as fh:
             json.dump(rows, fh, indent=2, ensure_ascii=False, default=str)
 
-        logger.info("Exported %d leads → %s", len(rows), path)
+        logger.info("Exported %d leads -> %s", len(rows), path)
         return len(rows)
 
     def count(self) -> int:
-        """Restituisce il numero totale di lead nel database."""
+        """Return the total number of leads stored in the database."""
         return self._conn().execute("SELECT COUNT(*) FROM leads").fetchone()[0]
 
     def close(self) -> None:
-        """Chiude la connessione del thread corrente."""
+        """Close the current thread's database connection."""
         conn = getattr(self._local, "conn", None)
         if conn:
             conn.close()
             self._local.conn = None
+
 
 # ---------------------------------------------------------------------------
 # UTILITIES
@@ -299,13 +299,13 @@ class LeadDB:
 
 def normalize_url(url: str) -> str:
     """
-    Normalizza un URL: aggiunge schema https se mancante e rimuove trailing slash.
+    Normalise a URL: prepend https:// if no scheme is present and strip trailing slashes.
 
     Args:
-        url: stringa URL grezza.
+        url: raw URL string.
 
     Returns:
-        URL normalizzato o stringa vuota se non valido.
+        Normalised URL, or an empty string if the input is blank.
     """
     url = (url or "").strip()
     if not url:
@@ -317,13 +317,13 @@ def normalize_url(url: str) -> str:
 
 def get_domain(url: str) -> str:
     """
-    Estrae il dominio netto da un URL (senza www).
+    Extract the bare domain from a URL (strips www. prefix).
 
     Args:
-        url: stringa URL.
+        url: URL string.
 
     Returns:
-        Dominio o 'unknown' in caso di errore.
+        Lowercase domain, or 'unknown' on parse error.
     """
     try:
         return urlparse(url).netloc.replace("www.", "").lower() or "unknown"
@@ -333,16 +333,16 @@ def get_domain(url: str) -> str:
 
 def extract_emails(text: str, html: str) -> List[str]:
     """
-    Estrae indirizzi email dal testo visibile e dai link mailto:.
+    Extract email addresses from visible page text and mailto: links.
 
-    Filtra domini bloccati ed estensioni di file note non-email.
+    Filters out known blocked domains and file-extension false positives.
 
     Args:
-        text: testo visibile della pagina.
-        html: sorgente HTML grezzo.
+        text: visible text content of the page.
+        html: raw HTML source.
 
     Returns:
-        Lista ordinata di email univoche in minuscolo.
+        Sorted list of unique lowercase email addresses.
     """
     candidates: set[str] = set()
     candidates.update(_EMAIL_RE.findall(text))
@@ -360,20 +360,21 @@ def extract_emails(text: str, html: str) -> List[str]:
 
     return sorted(result)
 
+
 # ---------------------------------------------------------------------------
 # HTTP SCRAPER
 # ---------------------------------------------------------------------------
 
 async def fetch(session: aiohttp.ClientSession, url: str) -> Optional[str]:
     """
-    Esegue GET con retry esponenziale e rispetto di Retry-After.
+    Perform a GET request with exponential-jitter retry and Retry-After support.
 
     Args:
-        session: sessione aiohttp condivisa.
-        url:     URL da scaricare.
+        session: shared aiohttp client session.
+        url:     target URL.
 
     Returns:
-        Testo HTML della risposta o None se tutti i tentativi falliscono.
+        Response HTML text, or None if all attempts fail.
     """
     headers = {"User-Agent": random.choice(USER_AGENTS)}
 
@@ -384,7 +385,7 @@ async def fetch(session: aiohttp.ClientSession, url: str) -> Optional[str]:
                     return await resp.text(errors="replace")
 
                 if resp.status == 429:
-                    # Rispetta Retry-After se presente, altrimenti backoff
+                    # Honour Retry-After if present, otherwise use progressive backoff
                     retry_after = resp.headers.get("Retry-After")
                     wait = float(retry_after) if retry_after and retry_after.isdigit() \
                            else 5.0 * (attempt + 1)
@@ -404,7 +405,7 @@ async def fetch(session: aiohttp.ClientSession, url: str) -> Optional[str]:
             logger.warning("Fetch error %s (attempt %d/%d): %s",
                            url, attempt + 1, CONFIG.retries, type(exc).__name__)
 
-        # Jitter esponenziale: 1s, 2s±jitter, 4s±jitter
+        # Exponential jitter backoff: ~1s, ~2s, ~4s
         backoff = (2 ** attempt) + random.uniform(0, 0.5)
         await asyncio.sleep(backoff)
 
@@ -413,13 +414,13 @@ async def fetch(session: aiohttp.ClientSession, url: str) -> Optional[str]:
 
 def extract_text(html: str) -> str:
     """
-    Estrae testo pulito dall'HTML rimuovendo script, stili e elementi non-content.
+    Extract clean text from HTML by removing scripts, styles, and non-content tags.
 
     Args:
-        html: sorgente HTML grezzo.
+        html: raw HTML source.
 
     Returns:
-        Testo normalizzato (max TEXT_MAX_CHARS caratteri).
+        Normalised text string (capped at text_max_chars characters).
     """
     soup = BeautifulSoup(html, "html.parser")
     for tag in soup(["script", "style", "nav", "footer", "aside", "noscript", "header"]):
@@ -432,21 +433,22 @@ def extract_text(html: str) -> str:
     text = root.get_text(separator=" ", strip=True)
     return re.sub(r"\s+", " ", text)[: CONFIG.text_max_chars]
 
+
 # ---------------------------------------------------------------------------
 # AI ANALYSIS — Ollama
 # ---------------------------------------------------------------------------
 
 def _extract_json_object(text: str) -> Optional[Dict]:
     """
-    Estrae il primo oggetto JSON valido da una stringa usando conteggio parentesi.
+    Extract the first valid JSON object from a string using brace counting.
 
-    Più robusto di un semplice json.loads() su testo misto.
+    More robust than a bare json.loads() call on mixed-content text.
 
     Args:
-        text: stringa che può contenere JSON embedded in testo libero.
+        text: string that may contain a JSON object embedded in free text.
 
     Returns:
-        Dizionario Python o None se non trovato.
+        Parsed Python dict, or None if no valid object is found.
     """
     depth, start = 0, None
     for i, ch in enumerate(text):
@@ -460,7 +462,7 @@ def _extract_json_object(text: str) -> Optional[Dict]:
                 try:
                     return json.loads(text[start: i + 1])
                 except json.JSONDecodeError:
-                    start = None  # Prova il prossimo oggetto
+                    start = None  # Try the next object candidate
     return None
 
 
@@ -473,20 +475,20 @@ _OLLAMA_PROMPT_TEMPLATE = (
 
 def _run_ollama(text: str, model: str) -> Optional[Dict]:
     """
-    Chiamata bloccante a Ollama.
+    Blocking Ollama inference call.
 
-    NOTA: chiamare sempre tramite _try_ollama() — non invocare direttamente
-    dall'event loop asincrono per evitare il blocco del thread principale.
+    NOTE: always invoke via _try_ollama() — never call directly from the
+    async event loop or you will block all concurrent workers.
 
     Args:
-        text:  testo da analizzare.
-        model: nome del modello Ollama.
+        text:  page text to analyse.
+        model: Ollama model name (e.g. 'llama3', 'mistral').
 
     Returns:
-        Dizionario con dati del lead o None in caso di errore.
+        Lead data dict, or None on error.
     """
     try:
-        import ollama  # opzionale — installare solo se si usa Ollama
+        import ollama  # optional — only required when using Ollama
 
         prompt = _OLLAMA_PROMPT_TEMPLATE.format(text=text)
         res    = ollama.generate(model=model, prompt=prompt)
@@ -499,7 +501,7 @@ def _run_ollama(text: str, model: str) -> Optional[Dict]:
             return data
 
     except ImportError:
-        logger.debug("Ollama non installato — uso heuristics")
+        logger.debug("Ollama not installed — falling back to heuristics")
     except Exception as exc:
         logger.debug("Ollama call error: %s", exc)
 
@@ -508,16 +510,16 @@ def _run_ollama(text: str, model: str) -> Optional[Dict]:
 
 async def _try_ollama(text: str) -> Optional[Dict]:
     """
-    Wrapper asincrono attorno a _run_ollama().
+    Async wrapper around the blocking _run_ollama().
 
-    Esegue la chiamata bloccante in un thread pool (asyncio.to_thread) e
-    applica un timeout cross-platform con asyncio.wait_for().
+    Runs the blocking call in a thread-pool worker via asyncio.to_thread()
+    and applies a cross-platform timeout via asyncio.wait_for().
 
     Args:
-        text: testo da analizzare.
+        text: page text to analyse.
 
     Returns:
-        Dizionario con dati del lead o None se timeout/errore.
+        Lead data dict, or None on timeout or error.
     """
     try:
         return await asyncio.wait_for(
@@ -525,12 +527,13 @@ async def _try_ollama(text: str) -> Optional[Dict]:
             timeout=CONFIG.ollama_timeout,
         )
     except asyncio.TimeoutError:
-        logger.warning("Ollama timeout dopo %.0fs — fallback a heuristics",
+        logger.warning("Ollama timed out after %.0fs — falling back to heuristics",
                        CONFIG.ollama_timeout)
         return None
     except Exception as exc:
         logger.debug("Ollama wrapper error: %s", exc)
         return None
+
 
 # ---------------------------------------------------------------------------
 # AI ANALYSIS — Heuristic Fallback
@@ -538,35 +541,35 @@ async def _try_ollama(text: str) -> Optional[Dict]:
 
 def _heuristic_analysis(text: str, url: str) -> Dict:
     """
-    Analisi basata su keyword come fallback quando Ollama non è disponibile.
+    Keyword-based scoring used as a fallback when Ollama is unavailable.
 
-    Score = hits keyword (pesati) + bonus lunghezza testo, clampato in [0, 10].
+    Score = keyword hit count + text-length bonus, clamped to [0, 10].
 
     Args:
-        text: testo visibile della pagina.
-        url:  URL della pagina (usato per inferire il nome azienda).
+        text: visible page text.
+        url:  page URL (used to infer the company name from the domain).
 
     Returns:
-        Dizionario con company, service, score, qualified.
+        Dict with keys: company, service, score, qualified.
     """
     text_lower = text.lower()
     domain     = get_domain(url)
 
-    # Keyword matching con peso progressivo
+    # Count keyword matches
     hits = sum(1 for kw in BUSINESS_KEYWORDS if kw in text_lower)
 
-    # Bonus per testi più ricchi di contenuto (max +2)
+    # Bonus for content-rich pages (max +2)
     length_bonus = min(2, len(text) // 800)
     score = min(10, max(0, hits + length_bonus))
 
-    # Nome azienda dal dominio
+    # Derive company name from the domain
     company = (
         domain.split(".")[0].replace("-", " ").replace("_", " ").title()
         if domain != "unknown"
         else "Unknown"
     )
 
-    # Servizio dalla prima keyword trovata
+    # Pick service label from the first matching keyword
     service = next(
         (label for kw, label in BUSINESS_KEYWORDS.items() if kw in text_lower),
         "Unknown",
@@ -582,17 +585,18 @@ def _heuristic_analysis(text: str, url: str) -> Dict:
 
 async def analyze_lead(text: str, url: str) -> Dict:
     """
-    Analizza un lead con Ollama; se non disponibile usa heuristics.
+    Analyse a lead with Ollama; fall back to heuristics if unavailable.
 
     Args:
-        text: testo estratto dalla pagina.
-        url:  URL della pagina.
+        text: extracted page text.
+        url:  page URL.
 
     Returns:
-        Dizionario con company, service, score, qualified.
+        Dict with keys: company, service, score, qualified.
     """
     result = await _try_ollama(text)
     return result if result else _heuristic_analysis(text, url)
+
 
 # ---------------------------------------------------------------------------
 # PIPELINE
@@ -606,17 +610,17 @@ async def process_url(
     counters:  Dict[str, int],
 ) -> Optional[Dict]:
     """
-    Processa un singolo URL: scarica, estrae, analizza, salva.
+    Process a single URL: fetch, extract, analyse, save.
 
     Args:
-        session:   sessione aiohttp condivisa.
-        semaphore: limita la concorrenza.
-        url:       URL da processare (già normalizzato).
-        db:        istanza LeadDB.
-        counters:  dizionario condiviso per tracking {fetched, qualified, saved}.
+        session:   shared aiohttp client session.
+        semaphore: concurrency limiter.
+        url:       already-normalised target URL.
+        db:        LeadDB instance.
+        counters:  shared counter dict tracking fetched / qualified / saved.
 
     Returns:
-        Dizionario del lead se qualificato e salvato, None altrimenti.
+        Lead dict if the page qualified and was saved, None otherwise.
     """
     async with semaphore:
         await asyncio.sleep(random.uniform(CONFIG.rate_limit_min, CONFIG.rate_limit_max))
@@ -663,15 +667,15 @@ async def run(
     workers: int = 0,
 ) -> tuple[List[Dict], Dict[str, int]]:
     """
-    Esegue la pipeline asincrona su una lista di URL.
+    Execute the async pipeline over a list of URLs.
 
     Args:
-        urls:    lista di URL già normalizzati e deduplicati.
-        db:      istanza LeadDB.
-        workers: numero massimo di worker concorrenti (0 = usa CONFIG).
+        urls:    normalised, deduplicated URL list.
+        db:      LeadDB instance.
+        workers: max concurrent workers (0 = use CONFIG.max_concurrent).
 
     Returns:
-        Tupla (lista lead qualificati, dizionario contatori).
+        Tuple of (qualified lead list, counters dict).
     """
     workers   = workers or CONFIG.max_concurrent
     semaphore = asyncio.Semaphore(workers)
@@ -700,9 +704,10 @@ async def run(
 
     counters["errors"] = errors
     if errors:
-        logger.warning("%d task(s) falliti — vedi pipeline.log", errors)
+        logger.warning("%d task(s) failed — see pipeline.log for details", errors)
 
     return leads, counters
+
 
 # ---------------------------------------------------------------------------
 # CLI
@@ -713,7 +718,7 @@ def _build_parser() -> argparse.ArgumentParser:
         description="Sovereign Lead Engine v3.5 — AI-powered B2B lead generation",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
-esempi:
+examples:
   python sovereign_lead_engine_v3_5.py urls.txt
   python sovereign_lead_engine_v3_5.py urls.txt --workers 10 --export both
   python sovereign_lead_engine_v3_5.py urls.txt --min-score 7 --export csv --output results
@@ -721,29 +726,29 @@ esempi:
         """,
     )
     parser.add_argument("input",
-                        help="File con URL (uno per riga, # per commenti)")
+                        help="Text file containing URLs (one per line, # for comments)")
     parser.add_argument("--workers", type=int, default=CONFIG.max_concurrent,
-                        help=f"Max worker concorrenti (default: {CONFIG.max_concurrent})")
+                        help=f"Max concurrent workers (default: {CONFIG.max_concurrent})")
     parser.add_argument("--export", choices=["csv", "json", "both"], default=None,
-                        help="Formato di esportazione")
+                        help="Export format")
     parser.add_argument("--output", default="leads_export",
-                        help="Nome file export senza estensione (default: leads_export)")
+                        help="Export filename without extension (default: leads_export)")
     parser.add_argument("--min-score", type=int, default=0,
-                        help="Mostra solo lead con score >= N (tutti salvati nel DB)")
+                        help="Only display leads with score >= N (all leads are still saved to DB)")
     parser.add_argument("--log-level", default="INFO",
                         choices=["DEBUG", "INFO", "WARNING", "ERROR"],
-                        help="Verbosità logging (default: INFO)")
+                        help="Logging verbosity (default: INFO)")
     return parser
 
 
 def main() -> None:
-    """Entry point CLI."""
+    """CLI entry point."""
     parser = _build_parser()
     args   = parser.parse_args()
 
     setup_logging(args.log_level)
 
-    # Carica URL dal file
+    # Load URLs from input file
     try:
         with open(args.input, encoding="utf-8") as fh:
             raw_urls = [
@@ -752,10 +757,10 @@ def main() -> None:
                 if line.strip() and not line.startswith("#")
             ]
     except FileNotFoundError:
-        logger.error("File non trovato: %s", args.input)
+        logger.error("Input file not found: %s", args.input)
         return
 
-    # Normalizza e deduplicata (preserva ordine)
+    # Normalise and deduplicate while preserving insertion order
     seen: set[str] = set()
     urls: List[str] = []
     for u in (normalize_url(r) for r in raw_urls):
@@ -764,11 +769,11 @@ def main() -> None:
             urls.append(u)
 
     if not urls:
-        logger.error("Nessun URL valido trovato in %s", args.input)
+        logger.error("No valid URLs found in %s", args.input)
         return
 
     logger.info(
-        "Caricati %d URL univoci | Workers: %d | Modello: %s",
+        "Loaded %d unique URLs | Workers: %d | Model: %s",
         len(urls), args.workers, CONFIG.ollama_model,
     )
 
@@ -777,27 +782,27 @@ def main() -> None:
         leads, counters = asyncio.run(run(urls, db, workers=args.workers))
         elapsed = time.perf_counter() - t0
 
-        # Filtra per min-score solo per la visualizzazione
+        # Filter by min-score for display only (all leads are persisted in DB)
         displayed = [r for r in leads if r.get("score", 0) >= args.min_score] \
                     if args.min_score else leads
 
-        # Riepilogo
+        # Print summary
         bar = "=" * 56
         print(f"\n{bar}")
-        score_note = f"  (score ≥ {args.min_score})" if args.min_score else ""
-        print(f"  Lead qualificati : {len(displayed)}{score_note}")
-        print(f"  Pagine scaricate : {counters.get('fetched', 0)}")
-        print(f"  Salvati nel DB   : {counters.get('saved', 0)}")
-        print(f"  Errori           : {counters.get('errors', 0)}")
-        print(f"  Tempo totale     : {elapsed:.1f}s")
-        print(f"  Costo AI         : $0.00")
+        score_note = f"  (score >= {args.min_score})" if args.min_score else ""
+        print(f"  Qualified leads  : {len(displayed)}{score_note}")
+        print(f"  Pages fetched    : {counters.get('fetched', 0)}")
+        print(f"  Saved to DB      : {counters.get('saved', 0)}")
+        print(f"  Errors           : {counters.get('errors', 0)}")
+        print(f"  Total time       : {elapsed:.1f}s")
+        print(f"  AI cost          : $0.00")
         print(f"{bar}\n")
 
         if displayed:
             print(f"  {'COMPANY':<28} {'SERVICE':<16} {'SCORE':<8} EMAIL")
             print(f"  {'-'*28} {'-'*16} {'-'*8} {'-'*30}")
             for r in sorted(displayed, key=lambda x: x.get("score", 0), reverse=True):
-                emails = ", ".join(r.get("emails", [])) or "—"
+                emails = ", ".join(r.get("emails", [])) or "-"
                 print(f"  {r['company']:<28} {r['service']:<16} {r['score']}/10     {emails}")
             print()
 
